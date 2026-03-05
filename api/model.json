@@ -1,0 +1,36 @@
+{
+  "bandwidth_mbps": 20,
+  "critical_task": 1,
+  "mobility_status": "High",
+  "number_of_instructions_mips": 1000,
+  "Infrastructure": {
+    "local": {
+      "mips_available": 100,
+      "ram_mb": 1000
+    },
+    "cloud": {
+      "mips_available": 10000,
+      "ram_mb": 16000
+    },
+    "Rsu": {
+      "RSU1": {
+        "mips_available": 2500,
+        "ram_mb": 4000,
+        "bandwidth_mbps": 50,
+        "sinr": 25
+      },
+      "RSU2": {
+        "mips_available": 1800,
+        "ram_mb": 2000,
+        "bandwidth_mbps": 30,
+        "sinr": 15
+      },
+      "RSU3": {
+        "mips_available": 3000,
+        "ram_mb": 8000,
+        "bandwidth_mbps": 100,
+        "sinr": 30
+      }
+    }
+  }
+}

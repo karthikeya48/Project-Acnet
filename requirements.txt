@@ -1,0 +1,17 @@
+fastapi[standard]
+uvicorn
+python-multipart
+
+pandas
+numpy
+scikit-learn
+
+torch
+torchvision
+torchaudio
+
+python-dotenv
+pydantic
+
+xgboost
+lightgbm
