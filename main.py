@@ -1,31 +1,28 @@
-from typing import Dict
 import torch
+import torch.nn as nn
 import joblib
-import math
+import copy
+import uvicorn
+from typing import Dict
+from threading import Lock
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from model import ACTNet 
-from hato_rsu_selection import hato_rsu_selector  
-app = FastAPI(title="ACTNet + HATO Task Offloading API")
 
-# --- 1. GLOBAL LOAD (Persistent in memory) ---
-try:
-    # Match your training: 3 continuous features, 1 categorical (3 levels), 3 output classes
-    model = ACTNet(cont_dim=3, cat_cardinalities=[3], num_classes=3)
-    model.load_state_dict(torch.load("model.pth", map_location=torch.device('cpu'), weights_only=True))
-    model.eval()
+# Import the model architecture from model.py
+from model import ACTNet
+from hato_rsu_selection import hato_rsu_selector 
 
-    # Load Pickled Preprocessors
-    scaler = joblib.load("scaler.pkl")
-    le_mobility = joblib.load("le_mobility.pkl")
-    le_target = joblib.load("le_target.pkl")
-except Exception as e:
-    print(f"Error loading model artifacts: {e}")
+app = FastAPI(title="ACTNet + FedAvg Offloading API")
 
+# --- GLOBAL STATE ---
+lock = Lock()
 weight_storage: Dict[str, dict] = {}
+global_model = None
+scaler = None
+le_mobility = None
+le_target = None
 
-
-# --- 2. INPUT SCHEMA ---
+# --- INPUT SCHEMA ---
 class OffloadRequest(BaseModel):
     bandwidth_mbps: float
     critical_task: int
@@ -33,103 +30,121 @@ class OffloadRequest(BaseModel):
     number_of_instructions_mips: float
     Infrastructure: dict
 
-# class TrainingUpdate(TaskData):
-#     actual_target: int  
+class TrainingUpdate(OffloadRequest):
+    vehicle_id: str
+    actual_target: str 
 
-
-
-# --- . ENDPOINT ---
-@app.post("/predict")
-async def predict_offload_decision(request: OffloadRequest):
+# --- INITIALIZATION ---
+@app.on_event("startup")
+def load_artifacts():
+    global global_model, scaler, le_mobility, le_target
     try:
-        # A. Preprocessing
-        # Reshape for scaler: [[bandwidth, critical, mips]]
+        global_model = ACTNet(cont_dim=3, cat_cardinalities=[3], num_classes=3)
+        global_model.load_state_dict(torch.load("model.pth", map_location='cpu', weights_only=True))
+        global_model.eval()
+        
+        scaler = joblib.load("scaler.pkl")
+        le_mobility = joblib.load("le_mobility.pkl")
+        le_target = joblib.load("le_target.pkl")
+        print("Model and preprocessors loaded successfully.")
+    except Exception as e:
+        print(f"Error loading model artifacts: {e}")
+
+# --- API ENDPOINTS ---
+
+@app.post("/predict")
+async def predict_decision(request: OffloadRequest):
+    try:
+        # Preprocessing
         raw_cont = [[request.bandwidth_mbps, request.critical_task, request.number_of_instructions_mips]]
-        scaled_cont = scaler.transform(raw_cont)
-        
-        # Map string (e.g., "High") to integer index
-        cat_val = le_mobility.transform([request.mobility_status])
-        
-        # B. Model Inference
+        scaled_cont = torch.tensor(scaler.transform(raw_cont), dtype=torch.float32)
+        cat_idx = torch.tensor([le_mobility.transform([request.mobility_status])], dtype=torch.long)
+
+        # Inference
         with torch.no_grad():
-            t_cont = torch.tensor(scaled_cont, dtype=torch.float32)
-            t_cat = torch.tensor([cat_val], dtype=torch.long)
-            logits = model(t_cont, t_cat)
+            logits = global_model(scaled_cont, cat_idx)
             class_idx = torch.argmax(logits, dim=1).item()
         
-        # C. Decode high-level decision (Local, Cloud, RSU)
         decision = le_target.inverse_transform([class_idx])[0]
-        
-        # D. HATO Layer (If ACTNet says RSU, we pick the specific one)
         final_target = decision
+
+        # HATO Layer for RSU selection
         if decision.lower() == "rsu":
             rsu_pool = request.Infrastructure.get("Rsu", {})
             if rsu_pool:
                 final_target = hato_rsu_selector(request.number_of_instructions_mips, rsu_pool)
             else:
-                final_target = "Generic RSU (No pool provided)"
+                final_target = "Generic RSU (Pool Empty)"
 
         return {
             "actnet_decision": decision,
-            "target_node": final_target,
-            "input_summary": {
-                "mips": request.number_of_instructions_mips,
-                "mobility": request.mobility_status
-            }
+            "target_node": final_target
         }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# @app.post("/update_local")
-# async def update_local(update: TrainingUpdate):
-#     local_model = copy.deepcopy(global_model)
-#     local_model.train()
-#     optimizer = torch.optim.Adam(local_model.parameters(), lr=0.001)
-#     criterion = nn.CrossEntropyLoss()
+@app.post("/local_update")
+async def local_update(update: TrainingUpdate):
+    """
+    Simulates a vehicle performing local training and sharing its model weights.
+    """
+    try:
+        # Clone global model for local fine-tuning
+        local_model = copy.deepcopy(global_model)
+        local_model.train()
+        optimizer = torch.optim.Adam(local_model.parameters(), lr=1e-3)
+        criterion = nn.CrossEntropyLoss()
 
-#     numeric = [update.signal_strength, update.critical_task, update.bandwidth_mbps, 
-#                update.number_of_instructions, update.task_size_MB]
-#     numeric_scaled = scaler.transform(np.array(numeric).reshape(1, -1)).astype(np.float32)
-#     cont_t = torch.from_numpy(numeric_scaled).to(device)
+        # Prepare Tensors
+        raw_cont = [[update.bandwidth_mbps, update.critical_task, update.number_of_instructions_mips]]
+        scaled_cont = torch.tensor(scaler.transform(raw_cont), dtype=torch.float32)
+        cat_idx = torch.tensor([le_mobility.transform([update.mobility_status])], dtype=torch.long)
+        
+        # Encode the 'correct' answer sent by the vehicle
+        target_idx = torch.tensor([le_target.transform([update.actual_target])[0]], dtype=torch.long)
 
-#     le = cat_encoders['mobility_status']
-#     mob_encoded = le.transform(np.array([update.mobility_status]))
-#     cat_t = torch.from_numpy(mob_encoded).reshape(1, -1).to(device)
+        # Optimization step
+        optimizer.zero_grad()
+        output = local_model(scaled_cont, cat_idx)
+        loss = criterion(output, target_idx)
+        loss.backward()
+        optimizer.step()
 
-#     label_t = torch.LongTensor([update.actual_target]).to(device)
+        # Save weights to server-side buffer
+        with lock:
+            weight_storage[update.vehicle_id] = local_model.state_dict()
+        
+        return {"status": "Weights received", "local_loss": float(loss)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-#     # 4. Train 1 Step
-#     optimizer.zero_grad()
-#     logits = local_model(cont_t, cat_t)
-#     loss = criterion(logits, label_t)
-#     loss.backward()
-#     optimizer.step()
+@app.post("/aggregate")
+async def aggregate_federated_model():
+    """
+    Combines all collected vehicle weights using Federated Averaging (FedAvg).
+    """
+    with lock:
+        if len(weight_storage) < 1:
+            raise HTTPException(status_code=400, detail="No updates available for aggregation.")
+        
+        all_updates = list(weight_storage.values())
+        avg_weights = copy.deepcopy(all_updates[0])
 
-#     weight_storage[update.vehicle_id] = local_model.state_dict()
+        # FedAvg: Calculate mean of parameters
+        for key in avg_weights.keys():
+            for i in range(1, len(all_updates)):
+                avg_weights[key] += all_updates[i][key]
+            avg_weights[key] = torch.div(avg_weights[key], len(all_updates))
 
-#     print(f"Stored local weights for {update.vehicle_id}")
-    
-#     return {"message": "Local update successful"}
-# @app.post("/aggregate")
-# async def aggregate():
-#     """Cloud triggers this to average all weights and update Global Model."""
-#     if not weight_storage:
-#         raise HTTPException(status_code=400, detail="No vehicle weights available.")
-#     all_weights = list(weight_storage.values())
-#     avg_weights = copy.deepcopy(all_weights[0])
-    
-#     for key in avg_weights.keys():
-#         for i in range(1, len(all_weights)):
-#             avg_weights[key] += all_weights[i][key]
-#         avg_weights[key] = torch.div(avg_weights[key], len(all_weights))
-#     global_model.load_state_dict(avg_weights)
-#     torch.save(global_model.state_dict(), "Global.pth")
-#     weight_storage.clear() 
-#     print("Global model updated via Federated Averaging.")
-#     return {"message": "Global Model Updated successfully via Federated Averaging."}
-
+        # Update Global Model
+        global_model.load_state_dict(avg_weights)
+        torch.save(global_model.state_dict(), "model.pth")
+        
+        # Clear buffer for next round
+        num_clients = len(weight_storage)
+        weight_storage.clear()
+        
+    return {"message": f"Global model updated using updates from {num_clients} clients."}
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
